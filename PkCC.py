@@ -4,68 +4,84 @@ import torch
 import torch.nn.functional as F
 
 def polynomial_kernel(X1, X2, degree=4, coef0=0.8):
-    return (X1 @ X2.T + coef0) ** degree
+    return (torch.mm(X1, X2.T) + coef0) ** degree
 
-def centre(K):
+def center_square(K, w=None, eps=1e-6):
     n = K.size(0)
-    H = torch.eye(n, device=K.device, dtype=K.dtype) - torch.ones(n, n, device=K.device, dtype=K.dtype) / n
-    return H @ K @ H
+    if w is None:
+        H = torch.eye(n, device=K.device, dtype=K.dtype) - torch.ones(n, n, device=K.device, dtype=K.dtype) / n
+        return H @ K @ H
+    w = w / (w.sum() + eps)
+    H = torch.eye(n, device=K.device, dtype=K.dtype) - torch.outer(torch.ones(n, device=K.device, dtype=K.dtype), w)
+    D = torch.diag(torch.sqrt(w + eps))
+    return H @ (D @ K @ D) @ H
 
-def centre_rect(K):
+def center_rect(K, ws=None, wt=None, eps=1e-6):
     n, m = K.shape
-    Hn = torch.eye(n, device=K.device, dtype=K.dtype) - torch.ones(n, n, device=K.device, dtype=K.dtype) / n
-    Hm = torch.eye(m, device=K.device, dtype=K.dtype) - torch.ones(m, m, device=K.device, dtype=K.dtype) / m
-    return Hn @ K @ Hm
+    if ws is None or wt is None:
+        Hn = torch.eye(n, device=K.device, dtype=K.dtype) - torch.ones(n, n, device=K.device, dtype=K.dtype) / n
+        Hm = torch.eye(m, device=K.device, dtype=K.dtype) - torch.ones(m, m, device=K.device, dtype=K.dtype) / m
+        return Hn @ K @ Hm
+    ws = ws / (ws.sum() + eps)
+    wt = wt / (wt.sum() + eps)
+    Hn = torch.eye(n, device=K.device, dtype=K.dtype) - torch.outer(torch.ones(n, device=K.device, dtype=K.dtype), ws)
+    Hm = torch.eye(m, device=K.device, dtype=K.dtype) - torch.outer(torch.ones(m, device=K.device, dtype=K.dtype), wt)
+    Ds = torch.diag(torch.sqrt(ws + eps))
+    Dt = torch.diag(torch.sqrt(wt + eps))
+    return Hn @ (Ds @ K @ Dt) @ Hm
 
-def pkcc(source_embeddings, source_labels,target_embeddings, target_pseudo_labels,num_classes, degree=4, coef0=0.8, regularization=0.3, eps=1e-8, jitter=1e-6):
-    device = source_embeddings.device
-    dtype  = source_embeddings.dtype
-    Ns, Nt = source_embeddings.size(0), target_embeddings.size(0)
+def pkcc(source_embeddings, source_labels, target_embeddings, target_pseudo_labels, num_classes, degree=4, coef0=0.8, regularization=0.3):
+    Xs, Xt = source_embeddings, target_embeddings
+    device, dtype = Xs.device, Xs.dtype
+    Ns, Nt = Xs.size(0), Xt.size(0)
+    eps = 1e-6 if dtype == torch.float32 else 1e-12
     if source_labels.dim() == 1:
-        source_probs = F.one_hot(source_labels.long(), num_classes=num_classes).to(device=device, dtype=dtype)
+        Ps = F.one_hot(source_labels.long(), num_classes=num_classes).to(device=device, dtype=dtype)
     else:
-        source_probs = source_labels.to(device=device, dtype=dtype)
-
+        Ps = source_labels.to(device=device, dtype=dtype)
     if target_pseudo_labels.dim() == 1:
-        target_probs = F.one_hot(target_pseudo_labels.long(), num_classes=num_classes).to(device=device, dtype=dtype)
+        Pt = F.one_hot(target_pseudo_labels.long(), num_classes=num_classes).to(device=device, dtype=dtype)
     else:
-        target_probs = target_pseudo_labels.to(device=device, dtype=dtype)
-
-    K_s_full  = polynomial_kernel(source_embeddings, source_embeddings, degree, coef0)
-    K_t_full  = polynomial_kernel(target_embeddings, target_embeddings, degree, coef0)
-    K_st_full = polynomial_kernel(source_embeddings, target_embeddings, degree, coef0)
-    I_s = torch.eye(Ns, device=device, dtype=dtype)
-    I_t = torch.eye(Nt, device=device, dtype=dtype)
-    loss = torch.zeros((), device=device, dtype=dtype)
-    classes = 0
+        Pt = target_pseudo_labels.to(device=device, dtype=dtype)
+    Kss = polynomial_kernel(Xs, Xs, degree, coef0)
+    Ktt = polynomial_kernel(Xt, Xt, degree, coef0)
+    Kst = polynomial_kernel(Xs, Xt, degree, coef0)
+    Kts = Kst.T
+    Is = torch.eye(Ns, device=device, dtype=dtype)
+    It = torch.eye(Nt, device=device, dtype=dtype)
+    loss = Xs.new_tensor(0.)
+    used = 0
     for c in range(num_classes):
-        ps = source_probs[:, c:c+1]
-        pt = target_probs[:, c:c+1]
-        if ps.sum() < eps or pt.sum() < eps:
+        ps = Ps[:, c:c+1]
+        pt = Pt[:, c:c+1]
+        if ps.sum() <= eps or pt.sum() <= eps:
             continue
+        ws = ps.squeeze(-1)
+        wt = pt.squeeze(-1)
+        Wss = ps @ ps.T
+        Wtt = pt @ pt.T
+        Wst = ps @ pt.T
+        Kss_c = center_square(Kss * Wss, ws, eps)
+        Ktt_c = center_square(Ktt * Wtt, wt, eps)
+        Kst_c = center_rect(Kst * Wst, ws, wt, eps)
+        Kts_c = Kst_c.T
+        Kss_c = 0.5 * (Kss_c + Kss_c.T)
+        Ktt_c = 0.5 * (Ktt_c + Ktt_c.T)
+        As = Kss_c + regularization * Is
+        At = Ktt_c + regularization * It
+        chol_As = torch.linalg.cholesky(As)
+        chol_At = torch.linalg.cholesky(At)
+        tmp_s  = torch.cholesky_solve(Kss_c, chol_As)
+        Cs     = Kss_c @ tmp_s
+        tmp_t  = torch.cholesky_solve(Kts_c, chol_At)
+        Ct_s   = Kst_c @ tmp_t
+        tmp_t2 = torch.cholesky_solve(Ktt_c, chol_At)
+        Ct     = Ktt_c @ tmp_t2
+        tmp_s2 = torch.cholesky_solve(Kst_c, chol_As)
+        Cs_t   = Kts_c @ tmp_s2
+        diff_s = Cs - Ct_s
+        diff_t = Ct - Cs_t
+        loss  += (diff_s.square().sum() + diff_t.square().sum()) * 0.5
+        used  += 1
+    return loss / max(used, 1)
 
-        W_ss = ps @ ps.T
-        W_tt = pt @ pt.T
-        W_st = ps @ pt.T
-
-        K_s_w  = K_s_full  * W_ss
-        K_t_w  = K_t_full  * W_tt
-        K_st_w = K_st_full * W_st
-        K_s_c  = centre(K_s_w)
-        K_t_c  = centre(K_t_w)
-        K_st_c = centre_rect(K_st_w)
-        L_s  = K_s_c  + regularization * I_s
-        L_t  = K_t_c  + regularization * I_t
-        L_st = K_st_c + regularization * I_s
-        chol_s  = torch.linalg.cholesky(L_s + jitter * I_s)
-        chol_t  = torch.linalg.cholesky(L_t + jitter * I_t)
-        chol_st = torch.linalg.cholesky(L_st + jitter * I_s)
-        Cs  = torch.cholesky_solve(K_s_c.T,  chol_s).T
-        Ct  = torch.cholesky_solve(K_t_c.T,  chol_t).T
-        Cst = torch.cholesky_solve(K_st_c.T, chol_st).T
-        diff = Cs + Ct - 2 * Cst
-        loss = loss + torch.norm(diff, p='fro').pow(2)
-        classes += 1
-    if classes == 0:
-        return torch.tensor(0.0, device=device, dtype=dtype)
-    return loss / classes
