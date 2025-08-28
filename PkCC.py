@@ -3,7 +3,7 @@
 import torch
 import torch.nn.functional as F
 
-def polynomial_kernel(X1, X2, degree=4, coef0=0.8):
+def polynomial_kernel(X1, X2, degree=4, coef0=1.0):
     return (torch.mm(X1, X2.T) + coef0) ** degree
 
 def center_square(K, w=None, eps=1e-6):
@@ -46,7 +46,6 @@ def pkcc(source_embeddings, source_labels, target_embeddings, target_pseudo_labe
     Kss = polynomial_kernel(Xs, Xs, degree, coef0)
     Ktt = polynomial_kernel(Xt, Xt, degree, coef0)
     Kst = polynomial_kernel(Xs, Xt, degree, coef0)
-    Kts = Kst.T
     Is = torch.eye(Ns, device=device, dtype=dtype)
     It = torch.eye(Nt, device=device, dtype=dtype)
     loss = Xs.new_tensor(0.)
@@ -74,14 +73,8 @@ def pkcc(source_embeddings, source_labels, target_embeddings, target_pseudo_labe
         tmp_s  = torch.cholesky_solve(Kss_c, chol_As)
         Cs     = Kss_c @ tmp_s
         tmp_t  = torch.cholesky_solve(Kts_c, chol_At)
-        Ct_s   = Kst_c @ tmp_t
-        tmp_t2 = torch.cholesky_solve(Ktt_c, chol_At)
-        Ct     = Ktt_c @ tmp_t2
-        tmp_s2 = torch.cholesky_solve(Kst_c, chol_As)
-        Cs_t   = Kts_c @ tmp_s2
-        diff_s = Cs - Ct_s
-        diff_t = Ct - Cs_t
-        loss  += (diff_s.square().sum() + diff_t.square().sum()) * 0.5
+        Cst    = Kst_c @ tmp_t
+        diff   = Cs - Cst
+        loss  += diff.square().sum()
         used  += 1
     return loss / max(used, 1)
-
